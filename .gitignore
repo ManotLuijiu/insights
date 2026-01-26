@@ -184,3 +184,6 @@ pids
 *.seed
 *.pid.lock
 todo
+
+insights/locale/
+insights/translations/
