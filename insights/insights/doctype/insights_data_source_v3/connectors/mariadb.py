@@ -20,6 +20,9 @@ def suppress_ibis_utc_warning(func):
 def get_mariadb_connection(data_source):
     password = data_source.get_password(raise_exception=False)
     data_source.port = int(data_source.port or 3306)
+    ssl_kwargs = (
+        {"ssl_verify_cert": True} if data_source.use_ssl else {"ssl_disabled": True}
+    )
     return ibis.mysql.connect(
         host=data_source.host,
         port=data_source.port,
@@ -28,5 +31,5 @@ def get_mariadb_connection(data_source):
         database=data_source.database_name,
         charset="utf8mb4",
         use_unicode=True,
-        ssl_mode="VERIFY_CA" if data_source.use_ssl else "DISABLED",
+        **ssl_kwargs,
     )

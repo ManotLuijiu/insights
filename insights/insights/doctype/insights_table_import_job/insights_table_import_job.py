@@ -8,7 +8,7 @@ from typing import Any
 
 import frappe
 import pandas as pd
-from frappe.core.doctype.scheduled_job_type.scheduled_job_type import parse_cron
+from croniter import croniter
 from frappe.model.document import Document
 from frappe.utils import get_datetime, now, now_datetime
 from frappe.utils.password import get_decrypted_password
@@ -72,7 +72,7 @@ class InsightsTableImportJob(Document):
 
         last_run = get_datetime(self.last_run or self.creation)
 
-        next_execution = parse_cron(self.schedule).get_next(datetime, start_time=last_run)
+        next_execution = croniter(self.schedule, start_time=last_run).get_next(datetime)
         return next_execution
 
     @frappe.whitelist()
