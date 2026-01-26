@@ -18,11 +18,11 @@ export default defineConfig({
 	server: {
 		allowedHosts: true,
 	},
-	esbuild: { loader: 'tsx' },
 	resolve: {
 		alias: {
 			'@': path.resolve(__dirname, 'src'),
 			'tailwind.config.js': path.resolve(__dirname, 'tailwind.config.js'),
+			'frappe-ui/src': path.resolve(__dirname, '..', 'node_modules/frappe-ui/src'),
 		},
 	},
 	build: {

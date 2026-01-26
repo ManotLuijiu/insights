@@ -1,7 +1,7 @@
 const plugin = require('tailwindcss/plugin')
 
 module.exports = {
-	presets: [require('frappe-ui/src/tailwind/preset')],
+	presets: [require('frappe-ui/tailwind')],
 	content: [
 		'./index.html',
 		'./src/**/*.{vue,js,ts,jsx,tsx}',
