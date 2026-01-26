@@ -18,8 +18,19 @@ export default defineConfig({
 	server: {
 		allowedHosts: true,
 	},
+	esbuild: { loader: 'ts' },
+	css: {
+		preprocessorOptions: {
+			scss: {
+				api: 'modern-compiler', // or "modern"
+				silenceDeprecations: ['legacy-js-api'],
+			},
+		},
+	},
 	resolve: {
 		alias: {
+			// https://github.com/vitejs/vite/discussions/16730#discussioncomment-13048825
+			vue: 'vue/dist/vue.esm-bundler.js',
 			'@': path.resolve(__dirname, 'src'),
 			'tailwind.config.js': path.resolve(__dirname, 'tailwind.config.js'),
 			'frappe-ui/src': path.resolve(__dirname, '..', 'node_modules/frappe-ui/src'),
@@ -29,9 +40,6 @@ export default defineConfig({
 		outDir: `../insights/public/frontend`,
 		emptyOutDir: true,
 		sourcemap: true,
-		commonjsOptions: {
-			include: [/tailwind.config.js/, /node_modules/],
-		},
 		rollupOptions: {
 			input: {
 				main: path.resolve(__dirname, 'index.html'),
@@ -45,7 +53,13 @@ export default defineConfig({
 		},
 	},
 	optimizeDeps: {
-		include: ['feather-icons', 'showdown', 'tailwind.config.js'],
+		esbuildOptions: {
+			loader: {
+				'.ts': 'ts',
+				'.tsx': 'tsx',
+			},
+		},
+		include: ['feather-icons', 'showdown', 'tailwind.config.js', 'highlight.js/lib/core'],
 	},
 	define: {
 		// enable hydration mismatch details in production build

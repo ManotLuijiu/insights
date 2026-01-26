@@ -1,19 +1,29 @@
 import { useDebouncedRefHistory } from '@vueuse/core'
 import { computed, reactive, toRefs, watch } from 'vue'
-import { copy, getUniqueId, safeJSONParse, waitUntil, wheneverChanges } from '../helpers'
+import {
+	copy,
+	copyToClipboard,
+	getUniqueId,
+	safeJSONParse,
+	waitUntil,
+	wheneverChanges,
+} from '../helpers'
 import { GranularityType } from '../helpers/constants'
 import useDocumentResource from '../helpers/resource'
+import { createToast } from '../helpers/toasts'
 import { column, count, query_table } from '../query/helpers'
 import useQuery, { Query } from '../query/query'
+import router from '../router'
 import {
 	AXIS_CHARTS,
 	AxisChartConfig,
+	BubbleChartConfig,
 	CHARTS,
 	DonutChartConfig,
+	MapChartConfig,
 	NumberChartConfig,
 	TableChartConfig,
 } from '../types/chart.types'
-import { AdhocFilters } from '../types/query.types'
 import { InsightsChartv3 } from '../types/workbook.types'
 import useWorkbook, { getLinkedQueries } from '../workbook/workbook'
 import { handleOldXAxisConfig, handleOldYAxisConfig, setDimensionNames } from './helpers'
@@ -40,16 +50,15 @@ function makeChart(name: string) {
 		() => chart.isloaded && refresh()
 	)
 
-	type ChartRefreshArgs = {
-		force?: boolean
-		adhocFilters?: AdhocFilters
-	}
-
 	const dataQuery = computed(() => {
 		if (!chart.isloaded) return {} as Query
 		return useQuery(chart.doc.data_query)
 	})
-	async function refresh(args: ChartRefreshArgs = {}) {
+	async function refresh(force?: boolean, reload?: boolean) {
+		if (reload) {
+			await chart.load()
+		}
+
 		await waitUntil(
 			() => chart.isloaded && dataQuery.value.isloaded && useQuery(chart.doc.query).isloaded
 		)
@@ -65,9 +74,10 @@ function makeChart(name: string) {
 		addLimitOperation(query)
 
 		const shouldExecute =
-			args.force ||
+			force ||
+			reload ||
 			!dataQuery.value.result.executedSQL ||
-			args.adhocFilters ||
+			dataQuery.value.adhocFilters ||
 			JSON.stringify(query.doc.operations) !== JSON.stringify(dataQuery.value.doc.operations)
 
 		if (!shouldExecute) {
@@ -76,7 +86,7 @@ function makeChart(name: string) {
 
 		dataQuery.value.setOperations(copy(query.doc.operations))
 		dataQuery.value.doc.use_live_connection = query.doc.use_live_connection
-		return dataQuery.value.execute(args.adhocFilters, args.force)
+		return dataQuery.value.execute(force)
 	}
 
 	function validateConfig() {
@@ -109,7 +119,7 @@ function makeChart(name: string) {
 					message: 'X-axis is required',
 				})
 			}
-			if (config.x_axis.dimension.column_name === config.split_by?.column_name) {
+			if (config.x_axis.dimension.column_name === config.split_by?.dimension.column_name) {
 				messages.push({
 					variant: 'error',
 					message: 'X-axis and Split by cannot be the same',
@@ -153,6 +163,42 @@ function makeChart(name: string) {
 			}
 		}
 
+		if (chart.doc.chart_type === 'Map') {
+			const config = chart.doc.config as MapChartConfig
+			const hasLocation = config.location_column.column_name
+			const hasValue = config.value_column.measure_name
+
+			if (!hasLocation) {
+				messages.push({
+					variant: 'error',
+					message: 'Location column is required',
+				})
+			}
+
+			if (!hasValue) {
+				messages.push({
+					variant: 'error',
+					message: 'Value column is required',
+				})
+			}
+		}
+
+		if (chart.doc.chart_type === 'Bubble') {
+			const config = chart.doc.config as BubbleChartConfig
+			if (!config.xAxis?.measure_name) {
+				messages.push({
+					variant: 'error',
+					message: 'X-axis is required',
+				})
+			}
+			if (!config.yAxis?.measure_name) {
+				messages.push({
+					variant: 'error',
+					message: 'Y-axis is required',
+				})
+			}
+		}
+
 		return !messages.length
 	}
 
@@ -185,6 +231,14 @@ function makeChart(name: string) {
 		if (chart.doc.chart_type === 'Table') {
 			addTableChartOperation(query)
 		}
+
+		if (chart.doc.chart_type === 'Map') {
+			addMapChartOperation(query)
+		}
+
+		if (chart.doc.chart_type === 'Bubble') {
+			addBubbleChartOperation(query)
+		}
 	}
 
 	function addAxisChartOperation(query: Query) {
@@ -193,11 +247,12 @@ function makeChart(name: string) {
 		let values = config.y_axis?.series.map((s) => s.measure).filter((m) => m.measure_name)
 		values = values?.length ? values : [count()]
 
-		if (config.split_by?.column_name) {
+		if (config.split_by?.dimension?.column_name) {
 			query.addPivotWider({
 				rows: [config.x_axis.dimension],
-				columns: [config.split_by],
+				columns: [config.split_by.dimension],
 				values: values,
+				max_column_values: config.split_by.max_split_values || 10,
 			})
 			return
 		}
@@ -251,6 +306,47 @@ function makeChart(name: string) {
 		query.addSummarize({
 			measures: values,
 			dimensions: rows,
+		})
+	}
+
+	function addMapChartOperation(query: Query) {
+		const config = chart.doc.config as MapChartConfig
+		let dimensions = [config.location_column]
+		query.addSummarize({
+			measures: [config.value_column],
+			dimensions: dimensions,
+		})
+	}
+
+	function addBubbleChartOperation(query: Query) {
+		const config = chart.doc.config as BubbleChartConfig
+
+		const dimensions: any[] = []
+		const measures: any[] = []
+
+		if (config.xAxis?.measure_name) {
+			measures.push(config.xAxis)
+		}
+
+		if (config.yAxis?.measure_name) {
+			measures.push(config.yAxis)
+		}
+
+		if (config.size_column?.measure_name) {
+			measures.push(config.size_column)
+		}
+
+		if (config.dimension?.column_name) {
+			dimensions.push(config.dimension)
+		}
+
+		if (config.quadrant_column?.column_name) {
+			dimensions.push(config.quadrant_column)
+		}
+
+		query.addSummarize({
+			measures: measures,
+			dimensions: dimensions,
 		})
 	}
 
@@ -322,9 +418,12 @@ function makeChart(name: string) {
 	}
 
 	function resetConfig() {
-		chart.doc.config = {} as InsightsChartv3['config']
-		chart.doc.config.order_by = []
-		chart.doc.config.limit = 100
+		// @ts-ignore
+		chart.doc.config = {
+			order_by: [],
+			filters: chart.doc.config.filters,
+			limit: chart.doc.config.limit,
+		}
 	}
 
 	// when chart type changes from axis to non-axis or vice versa reset the config
@@ -341,6 +440,26 @@ function makeChart(name: string) {
 			}
 		}
 	)
+
+	function copyChart() {
+		chart.call('export').then((data) => {
+			copyToClipboard(JSON.stringify(data, null, 2))
+		})
+	}
+
+	function duplicateChart() {
+		const workbook = useWorkbook(chart.doc.workbook)
+		return chart
+			.call('duplicate')
+			.then((newChartName: string) => {
+				createToast({
+					title: 'Chart duplicated',
+					variant: 'success',
+				})
+				router.push(`/workbook/${chart.doc.workbook}/chart/${newChartName}`)
+			})
+			.then(workbook.load)
+	}
 
 	const history = useDebouncedRefHistory(
 		// @ts-ignore
@@ -386,6 +505,10 @@ function makeChart(name: string) {
 		getDependentQueries,
 		getDependentQueryColumns,
 
+		copy: copyChart,
+		duplicate: duplicateChart,
+		openInDesk: () => window.open(`/app/insights-chart-v3/${chart.doc.name}`, '_blank'),
+
 		history,
 	})
 }
@@ -401,6 +524,7 @@ const INITIAL_DOC: InsightsChartv3 = {
 	query: '',
 	data_query: '',
 	chart_type: '',
+	sort_order: 0,
 	is_public: false,
 	config: {} as InsightsChartv3['config'],
 	operations: [],
@@ -415,11 +539,14 @@ function getChartResource(name: string) {
 		disableLocalStorage: true,
 		transform: transformChartDoc,
 	})
-	wheneverChanges(() => chart.doc.read_only, () => {
-		if (chart.doc.read_only) {
-			chart.autoSave = false
+	wheneverChanges(
+		() => chart.doc.read_only,
+		() => {
+			if (chart.doc.read_only) {
+				chart.autoSave = false
+			}
 		}
-	})
+	)
 	return chart
 }
 
@@ -444,9 +571,16 @@ function transformChartDoc(doc: any) {
 		// @ts-ignore
 		doc.config.y_axis = handleOldYAxisConfig(doc.config.y_axis)
 	}
+	if ('split_by' in doc.config && doc.config.split_by) {
+		// @ts-ignore
+		doc.config.split_by = handleOldXAxisConfig(doc.config.split_by)
+	}
 	if (doc.chart_type === 'Funnel') {
 		// @ts-ignore
 		doc.config.label_position = doc.config.label_position || 'left'
+	}
+	if (doc.chart_type === 'Donut') {
+		doc.config.legend_position = doc.config.legend_position || 'bottom'
 	}
 
 	doc.config = setDimensionNames(doc.config)

@@ -1,8 +1,11 @@
 import { useDebouncedRefHistory } from '@vueuse/core'
+import { Buffer } from 'buffer'
 import { isEqual } from 'es-toolkit'
+import { call, dayjs } from 'frappe-ui'
 import { computed, reactive, ref, toRefs, unref } from 'vue'
 import {
 	copy,
+	copyToClipboard,
 	getUniqueId,
 	safeJSONParse,
 	waitUntil,
@@ -13,6 +16,7 @@ import { confirmDialog } from '../helpers/confirm_dialog'
 import { FIELDTYPES } from '../helpers/constants'
 import useDocumentResource from '../helpers/resource'
 import { createToast } from '../helpers/toasts'
+import router from '../router'
 import session from '../session'
 import {
 	AdhocFilters,
@@ -20,9 +24,13 @@ import {
 	ColumnDataType,
 	ColumnOption,
 	CustomOperationArgs,
+	Dimension,
+	FilterArgs,
 	FilterGroupArgs,
 	FilterRule,
 	JoinArgs,
+	Measure,
+	Mutate,
 	MutateArgs,
 	Operation,
 	OrderByArgs,
@@ -38,13 +46,14 @@ import {
 	SummarizeArgs,
 	UnionArgs,
 } from '../types/query.types'
-import { InsightsQueryv3 } from '../types/workbook.types'
+import { InsightsQueryv3, QueryVariable } from '../types/workbook.types'
 import useWorkbook from '../workbook/workbook'
 import {
 	cast,
 	code,
 	column,
 	custom_operation,
+	expression,
 	filter_group,
 	getDimensions,
 	getFormattedRows,
@@ -113,12 +122,15 @@ export function makeQuery(name: string) {
 
 	const result = ref({ ...EMPTY_RESULT })
 	const executing = ref(false)
+	const downloading = ref(false)
+	const currentDownloadToken = ref<number | null>(null)
 	let lastExecutionArgs: {
 		operations: Operation[]
 		adhoc_filters?: AdhocFilters
 	}
 
-	async function execute(adhocFilters?: AdhocFilters, force: boolean = false) {
+	const adhocFilters = ref<AdhocFilters>()
+	async function execute(force: boolean = false) {
 		if (!query.islocal) {
 			await waitUntil(() => query.isloaded)
 		}
@@ -133,7 +145,7 @@ export function makeQuery(name: string) {
 			lastExecutionArgs &&
 			isEqual(lastExecutionArgs, {
 				operations: currentOperations.value,
-				adhoc_filters: adhocFilters,
+				adhoc_filters: adhocFilters.value,
 			})
 		) {
 			return Promise.resolve()
@@ -143,7 +155,8 @@ export function makeQuery(name: string) {
 		return query
 			.call('execute', {
 				active_operation_idx: activeOperationIdx.value,
-				adhoc_filters: adhocFilters,
+				adhoc_filters: adhocFilters.value,
+				force,
 			})
 			.then((response: any) => {
 				if (!response) return
@@ -170,7 +183,7 @@ export function makeQuery(name: string) {
 				executing.value = false
 				lastExecutionArgs = {
 					operations: currentOperations.value,
-					adhoc_filters: adhocFilters,
+					adhoc_filters: adhocFilters.value,
 				}
 			})
 	}
@@ -190,6 +203,7 @@ export function makeQuery(name: string) {
 		return query
 			.call('get_count', {
 				active_operation_idx: activeOperationIdx.value,
+				adhoc_filters: adhocFilters.value,
 			})
 			.then((count: number) => {
 				result.value.totalRowCount = count || 0
@@ -197,6 +211,24 @@ export function makeQuery(name: string) {
 			.finally(() => {
 				fetchingCount.value = false
 			})
+	}
+
+	async function formatSQL(args: SQLArgs): Promise<string> {
+		if (!args.raw_sql.trim()) return args.raw_sql || ''
+
+		try {
+			const formattedSQL = await query.call('format', { raw_sql: args.raw_sql.trim() })
+			const sqlOp = getSQLOperation()
+			if (sqlOp) {
+				sqlOp.raw_sql = formattedSQL
+			} else {
+				console.warn('No SQL operation found for native query.')
+			}
+			return formattedSQL
+		} catch (error) {
+			console.error('Error formatting SQL:', error)
+			return args.raw_sql
+		}
 	}
 
 	function setActiveOperation(index: number) {
@@ -357,6 +389,21 @@ export function makeQuery(name: string) {
 	}
 
 	function renameColumn(oldName: string, newName: string) {
+		// Check if there's a mutate operation with the old name
+		const existingMutateIdx = currentOperations.value.findIndex(
+			(op) => op.type === 'mutate' && op.new_name === oldName
+		)
+
+		if (existingMutateIdx !== -1) {
+			// Update the new_name property of the existing mutate operation
+			const mutateOp = query.doc.operations[existingMutateIdx] as Mutate
+			query.doc.operations[existingMutateIdx] = {
+				...mutateOp,
+				new_name: newName,
+			}
+			return
+		}
+
 		const existingRenameIdx = currentOperations.value.findIndex(
 			(op) => op.type === 'rename' && op.new_name === oldName
 		)
@@ -408,6 +455,21 @@ export function makeQuery(name: string) {
 	}
 
 	function changeColumnType(column_name: string, newType: ColumnDataType) {
+		// Check if there's a mutate operation with the old name
+		const existingMutateIdx = currentOperations.value.findIndex(
+			(op) => op.type === 'mutate' && op.new_name === column_name
+		)
+
+		if (existingMutateIdx !== -1) {
+			// Update the new_name property of the existing mutate operation
+			const mutateOp = query.doc.operations[existingMutateIdx] as Mutate
+			query.doc.operations[existingMutateIdx] = {
+				...mutateOp,
+				data_type: newType,
+			}
+			return
+		}
+
 		addOperation(
 			cast({
 				column: column(column_name),
@@ -432,14 +494,27 @@ export function makeQuery(name: string) {
 		activeOperationIdx.value = newOperations.length - 1
 	}
 
-	function downloadResults() {
+	function downloadResults(format: string = 'csv', filename?: string) {
 		const _downloadResults = () => {
-			return query
-				.call('download_results', {
+			downloading.value = true
+			const token = Date.now() + Math.random()
+			currentDownloadToken.value = token
+			return call('insights.api.run_doc_method', {
+				method: 'download_results',
+				docs: {
+					...(query.doc || {}),
+					__islocal: query.islocal,
+				},
+				args: {
+					format,
 					active_operation_idx: activeOperationIdx.value,
-				})
-				.then((csv_data: string) => {
-					if (!csv_data) {
+					adhoc_filters: adhocFilters.value,
+				},
+			})
+				.then((payload: any) => {
+					if (currentDownloadToken.value !== token) return
+					const data: string = payload?.message
+					if (!data) {
 						createToast({
 							title: 'Download Failed',
 							message: 'No data found to download.',
@@ -448,25 +523,65 @@ export function makeQuery(name: string) {
 						return
 					}
 
-					const blob = new Blob([csv_data], { type: 'text/csv' })
+					let blob: Blob
+					let extension: string
+					let mimeType: string
+
+					if (format === 'excel') {
+						const bytes = Buffer.from(data, 'base64')
+						blob = new Blob([bytes], {
+							type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+						})
+						extension = 'xlsx'
+						mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+					} else {
+						blob = new Blob([data], { type: 'text/csv' })
+						extension = 'csv'
+						mimeType = 'text/csv'
+					}
+
 					const url = window.URL.createObjectURL(blob)
 					const a = document.createElement('a')
 					a.setAttribute('hidden', '')
 					a.setAttribute('href', url)
-					a.setAttribute('download', `${query.doc.title || 'data'}.csv`)
+					const finalFileName = `${filename || query.doc.title || 'data'}.${extension}`
+					a.setAttribute('download', finalFileName)
 					document.body.appendChild(a)
 					a.click()
 					document.body.removeChild(a)
+					window.URL.revokeObjectURL(url)
+					createToast({
+						title: 'Export Successful',
+						message: `File "${finalFileName}" exported successfully`,
+						variant: 'success',
+					})
+				})
+				.catch((error: any) => {
+					if (currentDownloadToken.value !== token) return
+					createToast({
+						title: 'Download Failed',
+						message: error?.message || 'Failed to download file',
+						variant: 'error',
+					})
+				})
+				.finally(() => {
+					if (currentDownloadToken.value === token) {
+						downloading.value = false
+						currentDownloadToken.value = null
+					}
 				})
 		}
 
-		confirmDialog({
-			title: 'Download Results',
-			message:
-				'This action will download the datatable results as a CSV file. Do you want to proceed?',
-			primaryActionLabel: 'Yes',
-			onSuccess: _downloadResults,
-		})
+		_downloadResults()
+	}
+
+	function cancelDownload() {
+		currentDownloadToken.value = null
+		downloading.value = false
+	}
+
+	function exportResults(format: string, filename: string) {
+		downloadResults(format, filename)
 	}
 
 	function getDistinctColumnValues(column: string, search_term: string = '', limit: number = 20) {
@@ -477,6 +592,7 @@ export function makeQuery(name: string) {
 
 		return query.call('get_distinct_column_values', {
 			active_operation_idx: _activeOperationIdx,
+			adhoc_filters: adhocFilters.value,
 			column_name: column,
 			search_term,
 			limit,
@@ -519,12 +635,12 @@ export function makeQuery(name: string) {
 		return query.doc.operations.find((op) => op.type === 'sql')
 	}
 
-	function setSQL(args: SQLArgs) {
+	function setSQL(args: SQLArgs, force: boolean = false) {
 		query.doc.operations = []
 		if (args.raw_sql.trim().length) {
 			query.doc.operations.push(sql(args))
 			activeOperationIdx.value = 0
-			execute()
+			execute(force)
 		} else {
 			activeOperationIdx.value = -1
 		}
@@ -544,6 +660,29 @@ export function makeQuery(name: string) {
 		}
 	}
 
+	function updateVariables(variables: QueryVariable[]) {
+		if (!query.doc.is_script_query) return Promise.resolve()
+
+		query.doc.variables = variables
+		return query
+			.save()
+			.then(() => {
+				createToast({
+					title: 'Variables Updated',
+					message: 'Script variables have been saved securely.',
+					variant: 'success',
+				})
+			})
+			.catch((error) => {
+				createToast({
+					title: 'Failed to Update Variables',
+					message: error.message || 'An error occurred while saving variables.',
+					variant: 'error',
+				})
+				throw error
+			})
+	}
+
 	function getDrillDownQuery(col: QueryResultColumn, row: QueryResultRow) {
 		if (!session.isLoggedIn) {
 			return
@@ -561,59 +700,32 @@ export function makeQuery(name: string) {
 
 		const operations = copy(query.doc.operations)
 		const reversedOperations = operations.slice().reverse()
-		const lastSummarizeIdx = reversedOperations.findIndex((op) => op.type === 'summarize')
-		if (lastSummarizeIdx === -1) {
-			console.error('No summarize operation found')
-			return
-		}
-
-		const actualSummarizeIdx = reversedOperations.length - lastSummarizeIdx - 1
-		const summarizeOperation = operations[actualSummarizeIdx] as Summarize
-
-		const groupByColumns = summarizeOperation.dimensions
-		const rowIndex = result.value.formattedRows.findIndex((r) => r === row)
-		const currRow = result.value.rows[rowIndex]
-		const nextRow = result.value.rows[rowIndex + 1]
-
-		const filters: FilterRule[] = []
-		for (const c of groupByColumns) {
-			if (FIELDTYPES.TEXT.includes(c.data_type)) {
-				filters.push({
-					column: column(c.column_name),
-					operator: '=',
-					value: currRow[c.dimension_name] as string,
-				})
-			}
-
-			if (FIELDTYPES.DATE.includes(c.data_type)) {
-				if (nextRow) {
-					filters.push({
-						column: column(c.column_name),
-						operator: '>=',
-						value: currRow[c.dimension_name] as string,
-					})
-					filters.push({
-						column: column(c.column_name),
-						operator: '<',
-						value: nextRow[c.dimension_name] as string,
-					})
-				} else {
-					filters.push({
-						column: column(c.column_name),
-						operator: '>=',
-						value: currRow[c.dimension_name] as string,
-					})
-				}
-			}
-		}
 
 		const drill_down_query = useQuery('new-query-' + getUniqueId())
 		drill_down_query.doc.title = 'Drill Down'
-		drill_down_query.autoExecute = true
-		drill_down_query.doc.workbook = query.doc.workbook
 		drill_down_query.doc.use_live_connection = query.doc.use_live_connection
-		drill_down_query.setOperations(operations.slice(0, actualSummarizeIdx))
+		drill_down_query.autoExecute = true
 
+		let filters: FilterArgs[] = []
+		let sliceIdx = -1
+		const rowIndex = result.value.formattedRows.findIndex((r) => r === row)
+		const currRow = result.value.rows[rowIndex]
+
+		const lastPivotIdx = reversedOperations.findIndex((op: Operation) => op.type === 'pivot_wider')
+		if (lastPivotIdx !== -1) {
+			sliceIdx = reversedOperations.length - lastPivotIdx - 1
+			filters = getDrillDownQueryForPivot(operations, sliceIdx, col, currRow)
+		}
+
+		const lastSummarizeIdx = reversedOperations.findIndex(
+			(op: Operation) => op.type === 'summarize'
+		)
+		if (lastSummarizeIdx !== -1) {
+			sliceIdx = reversedOperations.length - lastSummarizeIdx - 1
+			filters = getDrillDownQueryForSummarize(operations, sliceIdx, col, currRow)
+		}
+
+		drill_down_query.setOperations(operations.slice(0, sliceIdx))
 		drill_down_query.addFilterGroup({
 			logical_operator: 'And',
 			filters: filters,
@@ -622,8 +734,140 @@ export function makeQuery(name: string) {
 		return drill_down_query
 	}
 
+	function getFiltersForDimension(dim: Dimension, value: string) {
+		const filters: FilterRule[] = []
+
+		if (!FIELDTYPES.DATE.includes(dim.data_type)) {
+			filters.push({
+				column: column(dim.column_name),
+				operator: '=',
+				value: value,
+			})
+		}
+
+		if (FIELDTYPES.DATE.includes(dim.data_type)) {
+			const start = dayjs(value)
+
+			filters.push({
+				column: column(dim.column_name),
+				operator: '>=',
+				value: start.format('YYYY-MM-DD HH:mm:ss'),
+			})
+
+			if (dim.granularity) {
+				const end = start.clone().add(1, dim.granularity)
+				filters.push({
+					column: column(dim.column_name),
+					operator: '<',
+					value: end.format('YYYY-MM-DD HH:mm:ss'),
+				})
+			}
+		}
+
+		return filters
+	}
+
+	function getFiltersForMeasure(measure: Measure, columnName: string) {
+		if (
+			measure.measure_name !== columnName ||
+			'expression' in measure === false ||
+			!measure.expression
+		) {
+			return []
+		}
+
+		// patterns to match to extract the condition
+		// 1. count_if(order_status == 'delivered')
+		// 2. count_if(order_status == 'delivered', order_id)
+		// 3. sum_if(order_status == 'delivered', order_id)
+		// 4. distinct_count_if(order_status == 'delivered', order_id)
+		const exp = measure.expression.expression
+		const patterns = [
+			/^count_if\(([^,]+),\s*([^)]+)\)$/,
+			/^count_if\(([^,]+)\)$/,
+			/^sum_if\(([^,]+),\s*([^)]+)\)$/,
+			/^distinct_count_if\(([^,]+),\s*([^)]+)\)$/,
+		]
+		const pattern = patterns.find((p) => exp.match(p))
+		if (pattern) {
+			const match = exp.match(pattern)
+			if (match) {
+				const condition = match[1].trim()
+				return [
+					{
+						expression: expression(condition),
+					},
+				]
+			}
+		}
+
+		return []
+	}
+
+	function getDrillDownQueryForSummarize(
+		operations: Operation[],
+		summarizeIdx: number,
+		col: QueryResultColumn,
+		row: QueryResultRow
+	) {
+		const filters: FilterArgs[] = []
+		const summarizeOperation = operations[summarizeIdx] as Summarize
+		summarizeOperation.dimensions.forEach((c) => {
+			filters.push(...getFiltersForDimension(c, row[c.dimension_name]))
+		})
+
+		summarizeOperation.measures.forEach((m) => {
+			filters.push(...getFiltersForMeasure(m, col.name))
+		})
+
+		return filters
+	}
+
+	function getDrillDownQueryForPivot(
+		operations: Operation[],
+		pivotIdx: number,
+		col: QueryResultColumn,
+		row: QueryResultRow
+	) {
+		const drill_down_query = useQuery('new-query-' + getUniqueId())
+		drill_down_query.doc.title = 'Drill Down'
+		drill_down_query.autoExecute = true
+		drill_down_query.doc.workbook = query.doc.workbook
+		drill_down_query.doc.use_live_connection = query.doc.use_live_connection
+		drill_down_query.setOperations(operations.slice(0, pivotIdx))
+
+		const pivotOperation = operations[pivotIdx] as PivotWiderArgs
+
+		const filters: FilterArgs[] = []
+		pivotOperation.rows.forEach((c) => {
+			filters.push(...getFiltersForDimension(c, row[c.dimension_name]))
+		})
+
+		const pivotColumnValues = col.name.split('___').reverse()
+		// each value in the pivot column values corresponds to a column in the pivot operation "columns"
+		// for eg. if the pivot column values are ["A", "B", "C"], then these values correspond to
+		// pivotOperation.columns[0], pivotOperation.columns[1], pivotOperation.columns[2]
+		pivotOperation.columns.forEach((c, idx) => {
+			if (pivotColumnValues[idx]) {
+				filters.push(...getFiltersForDimension(c, pivotColumnValues[idx]))
+			}
+		})
+
+		// if there are more than one value then there are two headers in the pivot table
+		// the last one displays the measure name, so we get the current measure name from pivotColumnValues
+		const selectedValueColumn =
+			pivotOperation.values.length == 1
+				? pivotOperation.values[0].measure_name
+				: (pivotColumnValues.at(-1) as string)
+		pivotOperation.values.forEach((m) => {
+			return filters.push(...getFiltersForMeasure(m, selectedValueColumn))
+		})
+
+		return filters
+	}
+
 	function validateDrillDown(col: QueryResultColumn, row: QueryResultRow) {
-		if (!query.doc.operations.find((op) => op.type === 'summarize')) {
+		if (!query.doc.operations.find((op) => op.type === 'summarize' || op.type === 'pivot_wider')) {
 			return 'Drill down is only supported on summarized data'
 		}
 
@@ -642,6 +886,26 @@ export function makeQuery(name: string) {
 		if (!result.value.formattedRows.find((r) => r === row)) {
 			return 'Row not found in the result'
 		}
+	}
+
+	function copyQuery() {
+		query.call('export').then((data) => {
+			copyToClipboard(JSON.stringify(data, null, 2))
+		})
+	}
+
+	function duplicateQuery() {
+		const workbook = useWorkbook(query.doc.workbook)
+		return query
+			.call('duplicate')
+			.then((newQueryName: string) => {
+				createToast({
+					title: 'Query duplicated',
+					variant: 'success',
+				})
+				router.push(`/workbook/${query.doc.workbook}/query/${newQueryName}`)
+			})
+			.then(workbook.load)
 	}
 
 	const history = useDebouncedRefHistory(
@@ -699,6 +963,7 @@ export function makeQuery(name: string) {
 		dataSource,
 		currentOperations,
 		activeEditOperation,
+		adhocFilters,
 
 		autoExecute,
 		executing,
@@ -731,12 +996,16 @@ export function makeQuery(name: string) {
 		getDistinctColumnValues,
 		getColumnsForSelection,
 		downloadResults,
-
+		exportResults,
+		downloading,
+		cancelDownload,
 		getSQLOperation,
 		setSQL,
+		formatSQL,
 
 		getCodeOperation,
 		setCode,
+		updateVariables,
 
 		dimensions,
 		measures,
@@ -744,6 +1013,8 @@ export function makeQuery(name: string) {
 		getMeasure,
 
 		getDrillDownQuery,
+		copy: copyQuery,
+		duplicate: duplicateQuery,
 
 		history,
 		canUndo() {
@@ -776,6 +1047,7 @@ const INITIAL_DOC: InsightsQueryv3 = {
 	workbook: '',
 	operations: [],
 	read_only: false,
+	sort_order: 0,
 }
 
 function getQueryResource(name: string) {

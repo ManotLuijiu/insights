@@ -21,10 +21,9 @@ def execute():
     for wb in workbooks:
         workbook = frappe.get_doc("Insights Workbook", wb)
 
-        queries = frappe.parse_json(workbook.queries)
-        charts = frappe.parse_json(workbook.charts)
-        dashboards = frappe.parse_json(workbook.dashboards)
-
+        queries = frappe.parse_json(workbook.queries) or []
+        charts = frappe.parse_json(workbook.charts) or []
+        dashboards = frappe.parse_json(workbook.dashboards) or []
         query_name_to_doc = {}
         chart_name_to_doc = {}
 
@@ -86,8 +85,8 @@ def execute():
 
             for item in dashboard["items"]:
                 if item.type == "chart":
-                    chart = chart_name_to_doc[item.chart]
-                    item.chart = chart.name
+                    chart = chart_name_to_doc.get(item.chart)
+                    item.chart = chart.name if chart else None
 
                 if item.type == "filter":
                     new_links = {}
